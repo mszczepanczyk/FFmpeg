@@ -23,6 +23,7 @@
 #include "libavutil/dict.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libavutil/avassert.h"
 #include "os_support.h"
 #include "avformat.h"
 #if CONFIG_NETWORK
@@ -416,6 +417,61 @@ int avio_check(const char *url, int flags)
 
     ffurl_close(h);
     return ret;
+}
+
+int avio_open_dir(void **s, const char *url, AVDictionary **options)
+{
+    URLContext *h = NULL;
+    int ret;
+    av_assert0(s);
+    if ((ret = ffurl_alloc(&h, url, AVIO_FLAG_READ, NULL)) < 0)
+        goto fail;
+
+    if (h->prot->url_open_dir && h->prot->url_read_dir && h->prot->url_close_dir) {
+        if (options && h->prot->priv_data_class &&
+            (ret = av_opt_set_dict(h->priv_data, options)) < 0)
+            goto fail;
+        ret = h->prot->url_open_dir(h);
+    }
+    else
+        ret = AVERROR(ENOSYS);
+    if (ret < 0)
+        goto fail;
+    *s = h;
+    return 0;
+
+  fail:
+    *s = NULL;
+    ffurl_close(h);
+    return ret;
+}
+
+int avio_read_dir(void *s, AVIODirEntry **next)
+{
+    URLContext *h = s;
+    int ret;
+    if ((ret = h->prot->url_read_dir(h, next)) < 0)
+        avio_free_directory_entry(next);
+    return ret;
+}
+
+int avio_close_dir(void **s)
+{
+    URLContext *h;
+    av_assert0(s);
+    h = *s;
+    h->prot->url_close_dir(h);
+    ffurl_close(h);
+    *s = NULL;
+    return 0;
+}
+
+void avio_free_directory_entry(AVIODirEntry **entry)
+{
+    if (!entry || !*entry)
+        return;
+    av_free((*entry)->name);
+    av_freep(entry);
 }
 
 int64_t ffurl_size(URLContext *h)
