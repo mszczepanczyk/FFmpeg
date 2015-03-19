@@ -28,6 +28,7 @@
 typedef struct {
     const AVClass *class;
     SMBCCTX *ctx;
+    int dh;
     int fd;
     int64_t filesize;
     int trunc;
@@ -182,6 +183,95 @@ static int libsmbc_write(URLContext *h, const unsigned char *buf, int size)
     return bytes_written;
 }
 
+static int libsmbc_open_dir(URLContext *h)
+{
+    LIBSMBContext *libsmbc = h->priv_data;
+    int ret;
+
+    if ((ret = libsmbc_connect(h)) < 0)
+        goto fail;
+
+    if ((libsmbc->dh = smbc_opendir(h->filename)) < 0) {
+        ret = AVERROR(errno);
+        av_log(h, AV_LOG_ERROR, "Error opening dir: %s\n", strerror(errno));
+        goto fail;
+    }
+
+    return 0;
+
+  fail:
+    libsmbc_close(h);
+    return ret;
+}
+
+static int libsmbc_read_dir(URLContext *h, AVIODirEntry **next)
+{
+    LIBSMBContext *libsmbc = h->priv_data;
+    AVIODirEntry *entry;
+    struct smbc_dirent *dirent = NULL;
+    char *url = NULL;
+
+    *next = entry = ff_alloc_dir_entry();
+    if (!entry)
+        return AVERROR(ENOMEM);
+
+    do {
+        dirent = smbc_readdir(libsmbc->dh);
+        if (!dirent) {
+            av_freep(next);
+            return 0;
+        }
+    } while (!strcmp(dirent->name, ".") || !strcmp(dirent->name, ".."));
+
+    entry->name = av_strdup(dirent->name);
+    if (!entry->name) {
+        av_freep(next);
+        return AVERROR(ENOMEM);
+    }
+
+    url = av_append_path_component(h->filename, dirent->name);
+    if (url) {
+        struct stat st;
+        if (!smbc_stat(url, &st)) {
+            entry->group_id = st.st_gid;
+            entry->user_id = st.st_uid;
+            entry->size = st.st_size;
+            entry->filemode = st.st_mode & 0777;
+            entry->modification_timestamp = INT64_C(1000000) * st.st_mtime;
+            entry->access_timestamp =  INT64_C(1000000) * st.st_atime;
+            entry->status_change_timestamp = INT64_C(1000000) * st.st_ctime;
+        }
+        av_free(url);
+    }
+
+    switch (dirent->smbc_type) {
+    case SMBC_DIR:
+        entry->type = AVIO_ENTRY_DIRECTORY;
+        break;
+    case SMBC_FILE:
+        entry->type = AVIO_ENTRY_FILE;
+        break;
+    default:
+        /* TODO: Find out what other types stand for and their correct
+         * mappings. Probably some of them should be skipped. */
+        entry->type = AVIO_ENTRY_UNKNOWN;
+        break;
+    }
+
+    return 0;
+}
+
+static int libsmbc_close_dir(URLContext *h)
+{
+    LIBSMBContext *libsmbc = h->priv_data;
+    if (libsmbc->dh >= 0) {
+        smbc_closedir(libsmbc->dh);
+        libsmbc->dh = -1;
+    }
+    libsmbc_close(h);
+    return 0;
+}
+
 #define OFFSET(x) offsetof(LIBSMBContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
@@ -206,6 +296,9 @@ URLProtocol ff_libsmbclient_protocol = {
     .url_write           = libsmbc_write,
     .url_seek            = libsmbc_seek,
     .url_close           = libsmbc_close,
+    .url_open_dir        = libsmbc_open_dir,
+    .url_read_dir        = libsmbc_read_dir,
+    .url_close_dir       = libsmbc_close_dir,
     .priv_data_size      = sizeof(LIBSMBContext),
     .priv_data_class     = &libsmbclient_context_class,
     .flags               = URL_PROTOCOL_FLAG_NETWORK,
